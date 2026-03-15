@@ -1,6 +1,6 @@
 # EC Observe (standalone)
 
-This repo provides a standalone EC observability workflow that does not depend on `OFC.py`.
+This repo provides a observability tool that is used to view the EC register values for MSI laptops ( GF65 thin 10UE ) .
 
 ## Files
 
