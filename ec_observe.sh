@@ -5,6 +5,9 @@ EC_IO_FILE="${EC_IO_FILE:-/sys/kernel/debug/ec/ec0/io}"
 OUT_DIR="${OUT_DIR:-./ec_logs}"
 EC_COUNT="${EC_COUNT:-256}"
 WRITES_LOG="${OUT_DIR}/ec_writes.csv"
+EC_READ_CHUNK_SIZE="${EC_READ_CHUNK_SIZE:-16}"
+EC_READ_TIMEOUT_SEC="${EC_READ_TIMEOUT_SEC:-2}"
+EC_DEBUG="${EC_DEBUG:-0}"
 
 # Defaults aligned with OpenFreezeCenter config.py values.
 CPU_TEMP_ADDR="${CPU_TEMP_ADDR:-104}"
@@ -53,11 +56,17 @@ require_cmd() {
   fi
 }
 
-with_sudo() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    "$@"
+debug_log() {
+  if [[ "$EC_DEBUG" == "1" ]]; then
+    echo "DEBUG: $*" >&2
+  fi
+}
+
+run_with_optional_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --foreground "${EC_READ_TIMEOUT_SEC}s" "$@"
   else
-    sudo "$@"
+    "$@"
   fi
 }
 
@@ -70,6 +79,22 @@ ensure_prereqs() {
     echo "EC IO file not found: $EC_IO_FILE" >&2
     exit 1
   fi
+}
+
+ensure_root_or_reexec() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    debug_log "already running as root"
+    return
+  fi
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "This command requires root and an interactive terminal." >&2
+    echo "Run it as: sudo ./ec_observe.sh $*" >&2
+    exit 1
+  fi
+
+  debug_log "re-execing with sudo"
+  exec sudo -- "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" "$@"
 }
 
 ensure_out_dir() {
@@ -96,7 +121,7 @@ to_int() {
 
 read_byte() {
   local addr="$1"
-  with_sudo dd if="$EC_IO_FILE" bs=1 skip="$addr" count=1 status=none \
+  run_with_optional_timeout dd if="$EC_IO_FILE" bs=1 skip="$addr" count=1 status=none \
     | od -An -tu1 \
     | tr -d '[:space:]'
 }
@@ -105,7 +130,7 @@ read_word_be() {
   local addr="$1"
   local hex
   hex="$(
-    with_sudo dd if="$EC_IO_FILE" bs=1 skip="$addr" count=2 status=none \
+    run_with_optional_timeout dd if="$EC_IO_FILE" bs=1 skip="$addr" count=2 status=none \
       | xxd -p \
       | tr -d '\n'
   )"
@@ -136,7 +161,7 @@ snapshot() {
   raw="${OUT_DIR}/${ts}_${name}.bin"
   txt="${OUT_DIR}/${ts}_${name}.txt"
 
-  with_sudo dd if="$EC_IO_FILE" bs=1 count="$count" status=none >"$raw"
+  run_with_optional_timeout dd if="$EC_IO_FILE" bs=1 count="$count" status=none >"$raw"
   xxd -g1 "$raw" >"$txt"
 
   echo "$txt"
@@ -178,7 +203,7 @@ write_byte() {
   fi
 
   hex_byte="$(printf '%02x' "$value")"
-  printf '%b' "\\x${hex_byte}" | with_sudo dd of="$EC_IO_FILE" bs=1 seek="$addr" conv=notrunc status=none
+  printf '%b' "\\x${hex_byte}" | run_with_optional_timeout dd of="$EC_IO_FILE" bs=1 seek="$addr" conv=notrunc status=none
   log_write "$addr" "$value" "$profile"
   echo "Wrote addr=${addr} (0x$(printf '%02x' "$addr")) value=${value} (0x${hex_byte}) profile=${profile}"
 }
@@ -223,9 +248,80 @@ watch_loop() {
 read_block_values() {
   local start="$1"
   local count="$2"
-  with_sudo dd if="$EC_IO_FILE" bs=1 skip="$start" count="$count" status=none \
-    | od -An -tu1 -v \
-    | tr -s '[:space:]' ' '
+  local chunk_size
+  local remaining
+  local offset
+  local this_count
+  local chunk_line
+  local -a chunk_values
+  local -a all_values=()
+
+  chunk_size="$(to_int "$EC_READ_CHUNK_SIZE")"
+  if ((chunk_size <= 0)); then
+    echo "EC_READ_CHUNK_SIZE must be > 0, got: $chunk_size" >&2
+    return 1
+  fi
+
+  remaining="$count"
+  offset=0
+  while ((remaining > 0)); do
+    this_count="$chunk_size"
+    if ((remaining < chunk_size)); then
+      this_count="$remaining"
+    fi
+
+    chunk_line="$(read_chunk_values_guarded "$((start + offset))" "$this_count")" || return 1
+    read -r -a chunk_values <<<"$chunk_line"
+    if ((${#chunk_values[@]} != this_count)); then
+      return 1
+    fi
+    all_values+=("${chunk_values[@]}")
+
+    remaining=$((remaining - this_count))
+    offset=$((offset + this_count))
+  done
+
+  printf '%s\n' "${all_values[*]}"
+}
+
+read_chunk_values_guarded() {
+  local start="$1"
+  local count="$2"
+  local tmp
+  local pid
+  local deadline
+
+  tmp="$(mktemp)"
+  debug_log "chunk_read start=${start} count=${count}"
+  (
+    dd if="$EC_IO_FILE" bs=1 skip="$start" count="$count" status=none \
+      | od -An -tu1 -v \
+      | tr -s '[:space:]' ' '
+  ) >"$tmp" &
+  pid=$!
+  deadline=$((SECONDS + EC_READ_TIMEOUT_SEC))
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      debug_log "chunk_read timeout start=${start} count=${count}"
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.05
+      kill -KILL "$pid" 2>/dev/null || true
+      rm -f "$tmp"
+      return 124
+    fi
+    sleep 0.05
+  done
+
+  if ! wait "$pid"; then
+    debug_log "chunk_read child_failed start=${start} count=${count}"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  debug_log "chunk_read done start=${start} count=${count}"
+  cat "$tmp"
+  rm -f "$tmp"
 }
 
 watch_unknown_loop() {
@@ -263,8 +359,13 @@ watch_unknown_loop() {
 
   echo "Watching UNKNOWN EC bytes every ${interval}s (start=${start}, count=${count}). Press Ctrl-C to stop."
   echo "Known/mapped addresses are excluded from output."
+  debug_log "capturing baseline start=${start} count=${count} chunk_size=${EC_READ_CHUNK_SIZE}"
 
-  line="$(read_block_values "$start" "$count" || true)"
+  if ! line="$(read_block_values "$start" "$count")"; then
+    echo "Failed to capture initial EC block without stalling." >&2
+    echo "Try reducing range, e.g.: ./ec_observe.sh watch-unknown ${interval} ${start} 128" >&2
+    exit 1
+  fi
   read -r -a previous <<<"$line"
   if ((${#previous[@]} != count)); then
     echo "Failed to capture initial EC block (${#previous[@]} bytes, expected ${count})." >&2
@@ -273,7 +374,10 @@ watch_unknown_loop() {
   echo "Baseline captured."
 
   while true; do
-    line="$(read_block_values "$start" "$count" || true)"
+    if ! line="$(read_block_values "$start" "$count")"; then
+      echo "$(ts_iso) read_stalled start=${start} count=${count}; exiting to avoid terminal lockup." >&2
+      exit 1
+    fi
     read -r -a current <<<"$line"
     if ((${#current[@]} != count)); then
       echo "$(ts_iso) read_error bytes=${#current[@]} expected=${count}"
@@ -336,6 +440,13 @@ action_diff() {
 
 main() {
   local cmd="${1:-help}"
+
+  case "$cmd" in
+    snapshot|action|watch|watch-unknown|watch_unknown|unknown|write)
+      ensure_root_or_reexec "$@"
+      ;;
+  esac
+
   shift || true
 
   case "$cmd" in
