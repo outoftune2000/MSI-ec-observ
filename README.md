@@ -7,11 +7,6 @@ This repo provides a standalone EC observability workflow that does not depend o
 - `ec_observe.sh`: capture snapshots, diff changes, live-watch addresses, and log manual writes.
 
 ## Quick start
-
-```bash
-chmod +x ec_observe.sh ec_diff.py
-```
-
 Most machines require root permissions for `/sys/kernel/debug/ec/ec0/io`, so run with `sudo`:
 
 ```bash
