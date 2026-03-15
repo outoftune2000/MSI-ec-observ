@@ -5,7 +5,6 @@ This repo provides a standalone EC observability workflow that does not depend o
 ## Files
 
 - `ec_observe.sh`: capture snapshots, diff changes, live-watch addresses, and log manual writes.
-- `ec_diff.py`: byte-level parser for `xxd -g1` dumps.
 
 ## Quick start
 
